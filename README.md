@@ -22,13 +22,18 @@ tp1/
     index.html
     httpd.conf                config Apache + reverse proxy vers le backend
 ```
-
+## Bonus ajout des variable de bd dans un .env + les noms des images
 `.env` (racine du projet, non versionné) :
 
 ```
 POSTGRES_DB=db
 POSTGRES_USER=usr
 POSTGRES_PASSWORD=pwd
+
+IMAGE_DATABASE=database
+IMAGE_BACKEND=backend-api
+IMAGE_HTTPD=http-server
+IMAGE_AUTOHEAL=willfarrell/autoheal
 ```
 
 Ces trois variables sont lues par le conteneur `database` (initialisation Postgres) et par le conteneur `backend` (`application.yml` les référence via `${...}` pour se connecter à la base), que ce soit lancé manuellement avec `--env-file` ou via `docker-compose.yml` avec `env_file`.
@@ -150,7 +155,8 @@ volumes:
 
 Seul `httpd` expose un port sur l'hôte (`database` et `backend` restent internes, joignables uniquement via `app-network`). `env_file` centralise les secrets. `depends_on` ordonne le démarrage. `restart: unless-stopped` relance un conteneur qui crashe. `pgdata` persiste les données de la base indépendamment des conteneurs.
 
-## Bonus – Segmentation réseau (protéger la base de données)
+# Bonus 
+## Segmentation réseau (protéger la base de données)
 
 Avec un seul réseau `app-network` partagé par les 3 conteneurs, `httpd` pouvait techniquement joindre directement `database`, alors qu'il n'en a aucun besoin (seul `backend` doit lui parler). Pour réduire la surface d'attaque, la base est isolée sur un réseau séparé, invisible depuis `httpd`.
 
@@ -186,7 +192,163 @@ $ docker exec -it http-server getent hosts database
 (aucune sortie : la résolution échoue)
 ```
 
-Depuis `httpd`, `database` ne résout à rien : les deux conteneurs ne partagent plus aucun réseau, `httpd` ne peut donc plus atteindre la base, même par erreur ou en cas de compromission du serveur web. L'application reste pleinement fonctionnelle (`http://localhost/departments/IRC/students` répond normalement) car le seul chemin nécessaire, `httpd → backend → database`, passe bien par les deux réseaux via `backend`.
+Depuis `httpd`, `database` ne résout à rien : les deux conteneurs ne partagent plus aucun réseau, `httpd` ne peut donc plus atteindre la base, même par erreur ou en cas de compromission du serveur web. L'application reste pleinement fonctionnelle (`http://localhost/departments/IRC/students` répond normalement) car le seul chemin nécessaire, `httpd -> backend -> database`, passe bien par les deux réseaux via `backend`.
 
+## Ajout d'une vérification du statut des images avant lancement 
+````
+services:
+  database:
+    build: .
+    image: ${IMAGE_DATABASE}
+    container_name: database
+    env_file:
+      - .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - back-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+  backend:
+    build: "./Backend API/simpleapi"
+    image: ${IMAGE_BACKEND}
+    container_name: backend-api
+    env_file:
+      - .env
+    depends_on:
+      database:
+        condition: service_healthy
+    networks:
+      - back-network
+      - front-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+  httpd:
+    build: "./HTTP Server"
+    image: ${IMAGE_HTTPD}
+    container_name: http-server
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - front-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  autoheal:
+    image: ${IMAGE_AUTOHEAL}
+    container_name: autoheal
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: all
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+networks:
+  back-network:
+    name: back-network
+  front-network:
+    name: front-network
+
+volumes:
+  pgdata:
+````
+
+**Utilité** :
+- `healthcheck` : teste si le service répond vraiment (pas juste démarré). `depends_on: condition: service_healthy` attend ce statut avant de lancer le service suivant, donc `backend` attend une base prête et `httpd` attend un backend prêt.
+- `autoheal` : surveille tous les conteneurs et redémarre ceux qui passent `unhealthy`. Complète `restart: unless-stopped`, qui ne gère que les crashs, pas les blocages.
+- `logging` (`max-size`/`max-file`) : limite la taille des logs pour éviter de saturer le disque.
+
+Détail du service `autoheal` :
+```yaml
+autoheal:
+  image: ${IMAGE_AUTOHEAL}
+  container_name: autoheal
+  environment:
+    AUTOHEAL_CONTAINER_LABEL: all
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  restart: unless-stopped
+```
+- `image` : image toute faite `willfarrell/autoheal`, pas besoin de la builder.
+- `AUTOHEAL_CONTAINER_LABEL: all` : surveille tous les conteneurs du projet, pas seulement ceux avec un label spécifique.
+- `volumes: /var/run/docker.sock` : donne accès au socket Docker de l'hôte, nécessaire pour qu'autoheal puisse lire l'état des conteneurs et les redémarrer.
+- `restart: unless-stopped` : relance autoheal lui-même s'il crashe.
+
+## Ajout d'Adminer (visualisation de la base en navigateur)
+
+`adminer` est ajouté comme conteneur à part, sur `back-network` (pour joindre `database`) et `front-network` (pour être joignable par `httpd`, qui ne fait pas partie de `back-network`) :
+
+```yaml
+adminer:
+  image: ${IMAGE_ADMINER}
+  container_name: adminer
+  environment:
+    ADMINER_DEFAULT_SERVER: database
+  depends_on:
+    database:
+      condition: service_healthy
+  networks:
+    - back-network
+    - front-network
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+```
+
+`ADMINER_DEFAULT_SERVER: database` pré-remplit le champ serveur du formulaire de connexion avec le nom du conteneur `database`.
+
+Accès : `http://localhost/adminer/`, avec système `PostgreSQL`, serveur `database`, utilisateur/mot de passe/base = les valeurs de `.env` (`POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`).
+
+## Test de la persistance des données avec Adminer
+
+Le volume nommé `pgdata` (déclaré dans `docker-compose.yml`) est censé conserver les données même si le conteneur `database` est supprimé. Voici comment le vérifier concrètement avec Adminer :
+
+1. Se connecter sur `http://localhost/adminer/` (système `PostgreSQL`, serveur `database`, identifiants `.env`).
+2. Modifier ou ajouter une ligne depuis Adminer (ex : éditer un étudiant, insérer une nouvelle ligne dans une table).
+3. Mettre fin au docker :
+   ```
+   docker compose down
+   ```
+5. Relancer le service :
+   ```
+   docker compose up -d database
+   ```
+6. Retourner sur `http://localhost/adminer/` et vérifié le contenu ou via l'endpoint.
