@@ -1,0 +1,43 @@
+services:
+  database:
+    build: .
+    image: database
+    container_name: database
+    env_file:
+      - .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  backend:
+    build: "./Backend API/simpleapi"
+    image: backend-api
+    container_name: backend-api
+    env_file:
+      - .env
+    depends_on:
+      - database
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  httpd:
+    build: "./HTTP Server"
+    image: http-server
+    container_name: http-server
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    name: app-network
+
+volumes:
+  pgdata:
