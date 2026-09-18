@@ -1,4 +1,4 @@
-# TP Docker – Application 3-tier
+# TP Docker : Application 3-tier
 
 ## Structure du projet
 
@@ -33,7 +33,7 @@ POSTGRES_PASSWORD=pwd
 
 Ces trois variables sont lues par le conteneur `database` (initialisation Postgres) et par le conteneur `backend` (`application.yml` les référence via `${...}` pour se connecter à la base), que ce soit lancé manuellement avec `--env-file` ou via `docker-compose.yml` avec `env_file`.
 
-Les 3 tiers : `database` (Postgres) ← `backend` (Spring Boot, Java 21) ← `httpd` (Apache, reverse proxy, seul point d'entrée exposé sur le port 80).
+Les 3 tiers : `database` (Postgres) <- `backend` (Spring Boot, Java 21) <- `httpd` (Apache, reverse proxy, seul point d'entrée exposé sur le port 80).
 
 ## Commandes de lancement
 
@@ -149,4 +149,44 @@ volumes:
 ```
 
 Seul `httpd` expose un port sur l'hôte (`database` et `backend` restent internes, joignables uniquement via `app-network`). `env_file` centralise les secrets. `depends_on` ordonne le démarrage. `restart: unless-stopped` relance un conteneur qui crashe. `pgdata` persiste les données de la base indépendamment des conteneurs.
+
+## Bonus – Segmentation réseau (protéger la base de données)
+
+Avec un seul réseau `app-network` partagé par les 3 conteneurs, `httpd` pouvait techniquement joindre directement `database`, alors qu'il n'en a aucun besoin (seul `backend` doit lui parler). Pour réduire la surface d'attaque, la base est isolée sur un réseau séparé, invisible depuis `httpd`.
+
+**Deux réseaux au lieu d'un :**
+- `back-network` : `database` <-> `backend` uniquement.
+- `front-network` : `backend` <-> `httpd` uniquement.
+- `backend` est le seul conteneur présent sur les deux réseaux (il doit parler à la base et être joignable par httpd) ; `database` n'est présente que sur `back-network`.
+
+```yaml
+networks:
+  back-network:
+    name: back-network
+  front-network:
+    name: front-network
+```
+
+(voir le fichier complet en question 1-8 ci-dessus)
+
+**Vérification** : la résolution DNS entre conteneurs prouve l'isolation.
+
+```
+$ docker exec -it backend-api getent hosts database
+172.20.0.2        database  database
+
+$ docker exec -it backend-api getent hosts http-server
+172.19.0.3        http-server  http-server
+```
+
+Le backend résout bien les deux noms, avec des IP sur deux sous-réseaux différents (`172.20.x.x` et `172.19.x.x`) confirmation qu'il est bien membre des deux réseaux.
+
+```
+$ docker exec -it http-server getent hosts database
+(aucune sortie : la résolution échoue)
+```
+
+Depuis `httpd`, `database` ne résout à rien : les deux conteneurs ne partagent plus aucun réseau, `httpd` ne peut donc plus atteindre la base, même par erreur ou en cas de compromission du serveur web. L'application reste pleinement fonctionnelle (`http://localhost/departments/IRC/students` répond normalement) car le seul chemin nécessaire, `httpd → backend → database`, passe bien par les deux réseaux via `backend`.
+
+
 

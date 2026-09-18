@@ -8,7 +8,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
-      - app-network
+      - back-network
     restart: unless-stopped
 
   backend:
@@ -20,7 +20,8 @@ services:
     depends_on:
       - database
     networks:
-      - app-network
+      - back-network
+      - front-network
     restart: unless-stopped
 
   httpd:
@@ -32,12 +33,14 @@ services:
     depends_on:
       - backend
     networks:
-      - app-network
+      - front-network
     restart: unless-stopped
 
 networks:
-  app-network:
-    name: app-network
+  back-network:
+    name: back-network
+  front-network:
+    name: front-network
 
 volumes:
   pgdata:

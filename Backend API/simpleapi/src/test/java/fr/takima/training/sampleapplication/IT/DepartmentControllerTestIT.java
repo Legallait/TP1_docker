@@ -58,6 +58,7 @@ class DepartmentControllerTestIT {
     @Test
     @Sql({"/InsertData.sql"})
     void testGetDepartmentCountByName() throws Exception {
+        mockMvc.perform(get("/departments/ASI/count"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", equalTo(48)));
     }
